@@ -3,3 +3,4 @@ node_modules/
 .DS_Store
 src-tauri/target/
 .vscode/
+.clipboard-uploads/
