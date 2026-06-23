@@ -1183,10 +1183,6 @@ function isNearBottom(): boolean {
   return messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < threshold;
 }
 
-function isNewChatSession(): boolean {
-  return !activeConversationId;
-}
-
 function getEffectiveProjectDir(): string {
   if (activeConversationId) {
     const conv = conversations.find((c) => c.id === activeConversationId);
@@ -1196,19 +1192,14 @@ function getEffectiveProjectDir(): string {
   return pendingProjectDir?.trim() || '';
 }
 
-function hasRequiredProjectDir(): boolean {
-  return getEffectiveProjectDir().length > 0;
-}
-
 function canSendMessage(content?: string): boolean {
   const input = document.querySelector<HTMLTextAreaElement>('#message-input');
   const text = (content ?? input?.value ?? '').trim();
   if (!text) {
     return false;
   }
-  if (isNewChatSession() && !hasRequiredProjectDir()) {
-    return false;
-  }
+  // 工作目录不是必填项：未选择时后端会回退到用户主目录，
+  // 因此只要有输入内容即可发起会话。
   return true;
 }
 
@@ -1316,7 +1307,7 @@ function getProjectDirDisplayLabel(dir: string): string {
 function getProjectDirHoverTitle(dir: string, canPick = canPickProjectDirectory()): string {
   const trimmed = dir.trim();
   if (!trimmed) {
-    return '点击选择工作目录';
+    return '可选：点击选择工作目录，不选则会话默认在主目录运行';
   }
   if (canPick) {
     return `工作目录: ${trimmed}（点击更换）`;
@@ -3725,10 +3716,6 @@ async function sendMessage() {
   const hasPastedImages = pasteAttachments.length > 0;
   if (!input.value.trim() && !hasPastedImages) return;
   if (sendBtn?.disabled) return;
-
-  if (isNewChatSession() && !hasRequiredProjectDir()) {
-    return;
-  }
 
   let content = input.value.trim();
   input.value = '';

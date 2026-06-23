@@ -2023,7 +2023,11 @@ fn spawn_claude_stream(
     // cmd.exe 会解析这些字符导致 "batch file arguments are invalid" 错误。
     // 使用 stdin 可以完全避免 shell 转义问题。
 
-    let effective_cwd = project_dir.and_then(|cwd| resolve_or_create_dir(cwd));
+    // 未指定工作目录时回退到用户主目录，避免 GUI 启动时继承到根目录 "/"。
+    let mut effective_cwd = project_dir.and_then(|cwd| resolve_or_create_dir(cwd));
+    if effective_cwd.is_none() {
+        effective_cwd = dirs::home_dir().map(|p| p.to_string_lossy().to_string());
+    }
 
     let claude_bin = resolve_claude_executable();
     let mut cmd = Command::new(&claude_bin);
