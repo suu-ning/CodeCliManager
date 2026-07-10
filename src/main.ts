@@ -1,123 +1,44 @@
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
-import { renderMarkdown as _renderMarkdown } from './markdown';
-
-// Markdown 渲染缓存：避免对相同内容重复调用 marked.parse + DOMPurify
-const _mdCache = new Map<string, string>();
-const _MD_CACHE_MAX = 3000;
-function renderMarkdown(src: string): string {
-  const cached = _mdCache.get(src);
-  if (cached !== undefined) return cached;
-  const html = _renderMarkdown(src);
-  if (_mdCache.size >= _MD_CACHE_MAX) {
-    // 简单 LRU：删除最早的条目
-    const firstKey = _mdCache.keys().next().value;
-    if (firstKey !== undefined) _mdCache.delete(firstKey);
-  }
-  _mdCache.set(src, html);
-  return html;
-}
-
-interface Message {
-  id: string;
-  role: string;
-  content: string;
-  thinking?: string;
-  timestamp: number;
-  refs?: FileRef[];
-}
-
-interface FileRef {
-  path: string;
-  isImage: boolean;
-}
-
-interface Conversation {
-  id: string;
-  title: string;
-  messages: Message[];
-  platform: string;
-  project_dir?: string | null;
-  source_path?: string | null;
-  created_at: number;
-  updated_at: number;
-  context_tokens?: number | null;
-  last_model?: string | null;
-}
-
-interface SessionErrorPayload {
-  conversationId: string | null;
-  error: string;
-}
-
-interface SessionEventPayload {
-  conversation_id: string;
-  conversationId?: string;
-  title: string;
-  messages: Message[];
-  project_dir?: string | null;
-  projectDir?: string | null;
-  updated_at: number;
-  updatedAt?: number;
-  context_tokens?: number | null;
-  last_model?: string | null;
-}
-
-interface PlatformConfig {
-  name: string;
-  command: string;
-  args: string[];
-  env_vars: Record<string, string>;
-}
-
-interface MessageChunkPayload {
-  conversation_id: string;
-  kind: string;
-  content: string;
-}
-
-interface ClaudeCodeApiConfig {
-  baseUrl: string;
-  hasApiKey: boolean;
-  defaultModel: string;
-  haikuModel: string;
-  sonnetModel: string;
-  opusModel: string;
-  displayModels?: string[];
-  customModels?: string[];
-  configPath: string;
-}
-
-interface ApiProfileItem {
-  id: string;
-  name: string;
-  baseUrl: string;
-  defaultModel: string;
-  hasApiKey: boolean;
-  isActive: boolean;
-}
-
-interface ApiProfilesState {
-  activeProfileId: string | null;
-  profiles: ApiProfileItem[];
-  current: ClaudeCodeApiConfig;
-}
-
-interface CcSwitchImportResult {
-  importedCount: number;
-  skippedCount: number;
-  skippedNames: string[];
-  ccSwitchPath: string;
-  state: ApiProfilesState;
-}
-
-interface FetchedModel {
-  id: string;
-  ownedBy?: string | null;
-}
-
-type ThemeMode = 'light' | 'dark';
+import { renderMarkdown } from './markdownCache';
+import {
+  closeProfileContextMenu,
+  fillOfficialView,
+  fillSettingsForm,
+  OFFICIAL_PROFILE_ID,
+  renderSettingsProfileList,
+  showProfileContextMenu,
+} from './settingsUi';
+import { invoke, listen, open } from './tauriApi';
+import type {
+  ApiProfilesState,
+  CcSwitchImportResult,
+  ClaudeCodeApiConfig,
+  ConfirmDialogOptions,
+  Conversation,
+  FetchedModel,
+  FileRef,
+  Message,
+  MessageChunkPayload,
+  PlatformConfig,
+  SessionErrorPayload,
+  SessionEventPayload,
+  StreamingState,
+  ThemeMode,
+} from './types';
+import {
+  escapeHtml,
+  formatCompactTime,
+  formatTime,
+  formatTokenCount,
+  getContextWindowFor,
+  getFileSuggestionIcon,
+  getImageMime,
+  getProjectDirDisplayLabel,
+  getProjectDirHoverTitle,
+  isImageFile,
+  isOtherBinaryFile,
+  renderCopyIconHtml,
+  renderProjectDirCopyIconHtml,
+} from './utils';
 
 const THEME_STORAGE_KEY = 'codemanager-theme';
 const CONVERSATION_MODELS_KEY = 'codemanager-conversation-models';
@@ -128,12 +49,6 @@ const LEGACY_DEFAULT_SIDEBAR_WIDTH = 320;
 const MIN_SIDEBAR_WIDTH = 160;
 const MIN_MAIN_CONTENT_WIDTH = 300;
 const SIDEBAR_RESIZER_WIDTH = 4;
-
-interface StreamingState {
-  thinking: string;
-  content: string;
-  thinkingDone: boolean;
-}
 
 let conversations: Conversation[] = [];
 let platforms: Record<string, PlatformConfig> = {};
@@ -739,7 +654,7 @@ async function init() {
       const conv = conversations.find(c => c.id === id);
       if (!conv) return;
       const timeEl = item.querySelector('.compact-time');
-      const newTime = formatCompactTime(conv.updated_at);
+      const newTime = formatCompactTime(conv.updated_at, currentTime);
       if (timeEl && newTime) {
         timeEl.textContent = newTime;
       }
@@ -1258,7 +1173,7 @@ function updateProjectDirControl() {
   const dir = getEffectiveProjectDir();
   const canPick = canPickProjectDirectory();
   const label = getProjectDirDisplayLabel(dir);
-  const title = getProjectDirHoverTitle(dir);
+  const title = getProjectDirHoverTitle(dir, canPick);
   const labelEl = control.querySelector('.project-dir-label');
   if (labelEl) {
     labelEl.textContent = label;
@@ -1282,52 +1197,6 @@ function updateProjectDirControl() {
   }
 
   updateSendButtonState();
-}
-
-function formatProjectDirShortName(dir: string): string {
-  const trimmed = dir.trim();
-  if (!trimmed) {
-    return '';
-  }
-  if (trimmed === '/') {
-    return '/';
-  }
-  if (/^[A-Za-z]:\\?$/.test(trimmed)) {
-    return trimmed.replace(/\\$/, '');
-  }
-  const normalized = trimmed.replace(/[\\/]+$/, '');
-  const segments = normalized.split(/[\\/]/).filter(Boolean);
-  return segments[segments.length - 1] || trimmed;
-}
-
-function getProjectDirDisplayLabel(dir: string): string {
-  return formatProjectDirShortName(dir) || '选择工作目录';
-}
-
-function getProjectDirHoverTitle(dir: string, canPick = canPickProjectDirectory()): string {
-  const trimmed = dir.trim();
-  if (!trimmed) {
-    return '可选：点击选择工作目录，不选则会话默认在主目录运行';
-  }
-  if (canPick) {
-    return `工作目录: ${trimmed}（点击更换）`;
-  }
-  return `工作目录: ${trimmed}（点击复制）`;
-}
-
-function renderCopyIconHtml(className = 'toolbar-copy-icon'): string {
-  return `
-    <span class="${className}" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <rect x="9" y="9" width="13" height="13" rx="2"/>
-        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-      </svg>
-    </span>
-  `;
-}
-
-function renderProjectDirCopyIconHtml(): string {
-  return renderCopyIconHtml('project-dir-toolbar-copy');
 }
 
 async function copyTextToClipboard(text: string): Promise<boolean> {
@@ -1585,20 +1454,6 @@ async function loadData() {
   }
 }
 
-function formatCompactTime(timestamp: number): string {
-  const date = new Date(timestamp * 1000);
-  const diffInMinutes = Math.floor(Math.max(0, currentTime.getTime() - date.getTime()) / (1000 * 60));
-  
-  if (diffInMinutes < 1) return '<1m';
-  if (diffInMinutes < 60) return `${diffInMinutes}m`;
-  
-  const diffInHours = Math.floor(diffInMinutes / 60);
-  if (diffInHours < 24) return `${diffInHours}hr`;
-  
-  const diffInDays = Math.floor(diffInHours / 24);
-  return `${diffInDays}d`;
-}
-
 function renderConversationList(): string {
   if (conversations.length === 0) {
     return '<div class="empty-state">No conversations yet</div>';
@@ -1610,7 +1465,7 @@ function renderConversationList(): string {
     const isRunning = runningSessions.has(c.id);
     const messageCount = c.messages.length;
     const platformName = platforms[c.platform]?.name || c.platform;
-    const compactTime = formatCompactTime(c.updated_at);
+    const compactTime = formatCompactTime(c.updated_at, currentTime);
     
     return `
       <div class="conversation-item ${isActive ? 'active' : ''} ${isEditing ? 'editing' : ''} ${isRunning ? 'running' : ''}" data-id="${c.id}">
@@ -1912,13 +1767,6 @@ function handleConversationListClick(e: Event) {
   }
 }
 
-interface ConfirmDialogOptions {
-  title: string;
-  message: string;
-  sub?: string;
-  confirmLabel?: string;
-}
-
 function showConfirmDialog(options: ConfirmDialogOptions): Promise<boolean> {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
@@ -1958,190 +1806,6 @@ function showDeleteConfirm(title: string): Promise<boolean> {
     sub: '此操作将永久删除本地会话记录，且不可恢复。',
     confirmLabel: '删除',
   });
-}
-
-function closeProfileContextMenu() {
-  document.querySelector('.profile-context-menu-overlay')?.remove();
-}
-
-interface ProfileContextMenuOptions {
-  x: number;
-  y: number;
-  profileId: string;
-  profileName: string;
-  isActive: boolean;
-  allowDelete?: boolean;
-  onApply: () => void | Promise<void>;
-  onDelete: () => void | Promise<void>;
-}
-
-function showProfileContextMenu(options: ProfileContextMenuOptions) {
-  closeProfileContextMenu();
-
-  const overlay = document.createElement('div');
-  overlay.className = 'profile-context-menu-overlay';
-  overlay.innerHTML = `
-    <div
-      class="profile-context-menu"
-      role="menu"
-      style="left: ${options.x}px; top: ${options.y}px"
-    >
-      <button
-        type="button"
-        class="profile-context-menu-item"
-        data-action="apply"
-        ${options.isActive ? 'disabled' : ''}
-        ${options.isActive ? 'title="该配置正在使用中"' : ''}
-      >应用</button>
-      ${options.allowDelete === false ? '' : `<button
-        type="button"
-        class="profile-context-menu-item profile-context-menu-item-danger"
-        data-action="delete"
-        ${options.isActive ? 'disabled' : ''}
-        ${options.isActive ? 'title="无法删除正在使用的配置"' : ''}
-      >删除</button>`}
-    </div>
-  `;
-
-  const close = () => {
-    overlay.remove();
-    document.removeEventListener('keydown', onKeyDown);
-  };
-
-  const onKeyDown = (event: KeyboardEvent) => {
-    if (event.key === 'Escape') {
-      close();
-    }
-  };
-
-  overlay.addEventListener('click', (event) => {
-    if (event.target === overlay) {
-      close();
-    }
-  });
-
-  overlay.querySelector('[data-action="apply"]')?.addEventListener('click', async () => {
-    if (options.isActive) return;
-    close();
-    await options.onApply();
-  });
-
-  overlay.querySelector('[data-action="delete"]')?.addEventListener('click', async () => {
-    if (options.isActive) return;
-    close();
-    await options.onDelete();
-  });
-
-  document.addEventListener('keydown', onKeyDown);
-  document.body.appendChild(overlay);
-
-  const menu = overlay.querySelector('.profile-context-menu') as HTMLElement | null;
-  if (menu) {
-    const rect = menu.getBoundingClientRect();
-    if (rect.right > window.innerWidth) {
-      menu.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
-    }
-    if (rect.bottom > window.innerHeight) {
-      menu.style.top = `${Math.max(8, window.innerHeight - rect.height - 8)}px`;
-    }
-  }
-}
-
-function renderSettingsProfileList(profiles: ApiProfileItem[], selectedProfileId: string | null): string {
-  const officialActive = !profiles.some((p) => p.isActive);
-  const officialSelected = selectedProfileId === OFFICIAL_PROFILE_ID;
-  const officialItem = `
-    <div
-      class="settings-profile-item settings-profile-official ${officialActive ? 'active' : ''} ${officialSelected ? 'selected' : ''}"
-      data-official="true"
-      role="button"
-      tabindex="0"
-      aria-label="使用官方默认（Claude 订阅）"
-    >
-      ${officialActive ? '<span class="settings-profile-badge">使用中</span>' : ''}
-      <div class="settings-profile-main">
-        <span class="settings-profile-name">官方默认</span>
-        <span class="settings-profile-meta">Claude 订阅 / 官方登录（清除自定义 API）</span>
-      </div>
-    </div>
-  `;
-
-  if (profiles.length === 0) {
-    return officialItem;
-  }
-
-  return officialItem + profiles
-    .map((profile) => {
-      const isSelected = selectedProfileId === profile.id;
-      const isActive = profile.isActive;
-      return `
-        <div
-          class="settings-profile-item ${isSelected ? 'selected' : ''} ${isActive ? 'active' : ''}"
-          data-profile-id="${profile.id}"
-          role="button"
-          tabindex="0"
-          aria-label="选择配置 ${escapeHtml(profile.name)}"
-        >
-          ${isActive ? '<span class="settings-profile-badge">使用中</span>' : ''}
-          <div class="settings-profile-main">
-            <span class="settings-profile-name">${escapeHtml(profile.name)}</span>
-            <span class="settings-profile-meta">${escapeHtml(profile.baseUrl || '未设置 Base URL')}</span>
-          </div>
-        </div>
-      `;
-    })
-    .join('');
-}
-
-// 官方默认伪配置的标识：用于「查看」其只读详情
-const OFFICIAL_PROFILE_ID = '__official__';
-
-/** 切换右侧表单是否可编辑（官方默认只读、无需保存） */
-function setSettingsFormEditable(overlay: HTMLElement, editable: boolean) {
-  for (const name of ['profileName', 'baseUrl', 'apiKey']) {
-    const el = overlay.querySelector(`input[name="${name}"]`) as HTMLInputElement | null;
-    if (el) el.disabled = !editable;
-  }
-  const modelInput = overlay.querySelector('.settings-model-config-summary') as HTMLInputElement | null;
-  if (modelInput) modelInput.classList.toggle('is-disabled', !editable);
-  const saveBtn = overlay.querySelector('.save-only') as HTMLButtonElement | null;
-  if (saveBtn) {
-    saveBtn.disabled = !editable;
-    saveBtn.title = editable ? '' : '官方默认无需保存';
-  }
-}
-
-/** 在右侧以只读方式展示「官方默认」详情 */
-function fillOfficialView(overlay: HTMLElement) {
-  overlay.dataset.profileId = OFFICIAL_PROFILE_ID;
-  (overlay.querySelector('input[name="profileName"]') as HTMLInputElement).value = '官方默认（Claude 订阅）';
-  const baseInput = overlay.querySelector('input[name="baseUrl"]') as HTMLInputElement;
-  baseInput.value = '';
-  baseInput.placeholder = '官方登录，无需 Base URL';
-  const keyInput = overlay.querySelector('input[name="apiKey"]') as HTMLInputElement;
-  keyInput.value = '';
-  keyInput.placeholder = '官方登录，无需 API Key';
-  const modelInput = overlay.querySelector('.settings-model-config-summary') as HTMLInputElement | null;
-  if (modelInput) modelInput.value = '由订阅 / 官方登录决定';
-  setSettingsFormEditable(overlay, false);
-}
-
-function fillSettingsForm(
-  overlay: HTMLElement,
-  config: ClaudeCodeApiConfig,
-  profileName = '',
-  profileId: string | null = null,
-) {
-  setSettingsFormEditable(overlay, true);
-  overlay.dataset.profileId = profileId || '';
-  (overlay.querySelector('input[name="profileName"]') as HTMLInputElement).value = profileName;
-  const baseInput = overlay.querySelector('input[name="baseUrl"]') as HTMLInputElement;
-  baseInput.value = config.baseUrl || '';
-  baseInput.placeholder = 'https://api.anthropic.com';
-
-  const apiKeyInput = overlay.querySelector('input[name="apiKey"]') as HTMLInputElement;
-  apiKeyInput.value = '';
-  apiKeyInput.placeholder = config.hasApiKey ? '已配置，留空则不修改' : 'sk-...';
 }
 
 async function refreshSettingsModal(
@@ -3463,17 +3127,6 @@ function renderFileRefChipsHtml(refs: FileRef[]): string {
     </div>`;
 }
 
-function formatTokenCount(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
-  if (n >= 1000) return Math.round(n / 1000) + 'K';
-  return String(n);
-}
-
-function getContextWindowFor(tokens: number): number {
-  // 用量超过 20 万即判定启用了 1M 上下文窗口，否则按标准 20 万
-  return tokens > 200_000 ? 1_000_000 : 200_000;
-}
-
 /** 右下角上下文环形指示器（参考 Claude 桌面端），悬停显示剩余空间 */
 function renderContextIndicatorInner(): string {
   const conv = activeConversationId
@@ -3985,20 +3638,6 @@ function handleKeydown(e: KeyboardEvent) {
   }
 }
 
-function formatTime(timestamp: number): string {
-  const date = new Date(timestamp * 1000);
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
 // 全局函数 - 用于 HTML 模板中调用
 function selectConversation(id: string) {
   activeConversationId = id;
@@ -4297,44 +3936,6 @@ function hideFileSuggestions() {
     container.style.display = 'none';
     container.innerHTML = '';
   }
-}
-
-/**
- * 根据文件路径判断文件类型，用于图标展示
- */
-function isImageFile(filePath: string): boolean {
-  const ext = filePath.split('.').pop()?.toLowerCase() || '';
-  return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'].includes(ext);
-}
-
-function isOtherBinaryFile(filePath: string): boolean {
-  const ext = filePath.split('.').pop()?.toLowerCase() || '';
-  return ['pdf', 'zip', 'tar', 'gz', '7z', 'rar', 'mp4', 'mp3', 'mov', 'avi',
-    'woff', 'woff2', 'ttf', 'eot', 'otf', 'exe', 'dll', 'so', 'dylib',
-    'class', 'jar', 'war', 'wasm', 'bin', 'dat', 'db', 'sqlite',
-    'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pages', 'numbers', 'key',
-  ].includes(ext);
-}
-
-function getFileSuggestionIcon(filePath: string): string {
-  // 目录
-  if (filePath.endsWith('/')) return '📁';
-  // 图片
-  if (isImageFile(filePath)) return '🖼️';
-  // 已知二进制
-  if (isOtherBinaryFile(filePath)) return '📎';
-  // 默认文本
-  return '📄';
-}
-
-function getImageMime(filePath: string): string {
-  const ext = filePath.split('.').pop()?.toLowerCase() || 'png';
-  const mimeMap: Record<string, string> = {
-    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-    gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
-    bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif',
-  };
-  return mimeMap[ext] || 'image/png';
 }
 
 async function viewImageFile(filePath: string) {
